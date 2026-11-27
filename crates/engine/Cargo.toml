@@ -1,0 +1,23 @@
+[package]
+name = "engine-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "engine_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+memmap2 = "0.9"
+zstd = "0.13"
+# детерминированная exp/ln/cos обучения (learn/detmath.rs): точная версия, без признаков — побитово одинаково на всех платформах
+libm = { version = "=0.2.11", default-features = false }
+# необязательные: включает признак lab
+crypto_box = { version = "0.9", features = ["seal"], optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

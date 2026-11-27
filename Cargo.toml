@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/engine", "crates/cli"]
+resolver = "2"
+
+# Лёгкий профиль для итераций: cargo build --profile fast
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug-assertions = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
