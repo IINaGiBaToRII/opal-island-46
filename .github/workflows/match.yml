@@ -1,0 +1,160 @@
+name: match
+run-name: r-${{ inputs.round }}
+# Бинарь — из выпуска сборки ЭТОГО коммита (build-<sha>): запуск, начатый до следующего push, от него не зависит.
+# Круг осколками: prepare (манифест, входы, план, есть ли готовый бинарь) -> build (только если нет выпуска для этого коммита)
+# -> shard (матрица номеров осколков; тождество + работа под ограничением времени) -> merge (итог) -> status.
+# Единственный вход — id круга; параметры — в зашифрованном манифесте m-<round>.<kfp>.enc выпуска rounds-inputs (ci/round.sh).
+# Каждый артефакт (shard-K, result) — один файл <артефакт>.<kfp>.enc: зашифрованный tar прежнего содержимого.
+on:
+  workflow_dispatch:
+    inputs:
+      round:
+        description: 'id круга'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      label: ${{ steps.plan.outputs.label }}
+      arch: ${{ steps.plan.outputs.arch }}
+      have_bin: ${{ steps.bin.outputs.have_bin }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        name: Round manifest, inputs, plan
+        env:
+          ROUNDS_KEY: ${{ secrets.ROUNDS_KEY }}
+          ROUND: ${{ inputs.round }}
+          GH_TOKEN: ${{ github.token }}
+        run: ci/round.sh prepare
+      - id: bin
+        name: Release for this commit?
+        run: |
+          C=$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/build-$GITHUB_SHA/BUILD_COMMIT" || true)
+          if [ "$C" = "$GITHUB_SHA" ]; then echo have_bin=true; else echo have_bin=false; fi >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.have_bin != 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      arches: '["${{ needs.prepare.outputs.arch }}"]'
+    permissions:
+      contents: write
+
+  shard:
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ needs.prepare.outputs.label }}
+    timeout-minutes: 350
+    # actions: read — облачный набор обучения (ci/train.sh): пачки — артефакты самоигры репозитория
+    permissions:
+      contents: read
+      actions: read
+    env:
+      ARCH: ${{ needs.prepare.outputs.arch }}
+      RUNNER_LABEL: ${{ needs.prepare.outputs.label }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Binary from this run
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: runner-linux-${{ needs.prepare.outputs.arch }}
+          path: dist
+      - name: Binary from release of this commit
+        if: needs.build.result == 'skipped'
+        run: |
+          mkdir -p dist && cd dist
+          U="https://github.com/$GITHUB_REPOSITORY/releases/download/build-$GITHUB_SHA"
+          curl -fsSL -O "$U/runner-linux-$ARCH" -O "$U/runner-linux-$ARCH.sha256" -O "$U/BUILD_COMMIT"
+          sha256sum -c --quiet "runner-linux-$ARCH.sha256"
+          test "$(cat BUILD_COMMIT)" = "$GITHUB_SHA"
+      - name: Shard
+        env:
+          ROUNDS_KEY: ${{ secrets.ROUNDS_KEY }}
+          ROUND: ${{ inputs.round }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x "dist/runner-linux-$ARCH"
+          BIN="dist/runner-linux-$ARCH" ci/round.sh shard
+      - name: Seal (what is there)
+        if: always()
+        env:
+          ROUNDS_KEY: ${{ secrets.ROUNDS_KEY }}
+        run: ci/round.sh seal
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: pack/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: warn
+
+  merge:
+    needs: [prepare, shard]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-24.04
+    # облачная пачка самоигры (ci/store.sh): шифрование кусков и tar до 1,9 ГБ — минуты (замер Э0: 1,9 ГБ за 17 с + загрузка 14 с)
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: shard-*
+          path: sealed
+          merge-multiple: true
+      - name: Result
+        env:
+          ROUNDS_KEY: ${{ secrets.ROUNDS_KEY }}
+          ROUND: ${{ inputs.round }}
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ needs.prepare.outputs.count }}
+        run: ci/round.sh merge
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: result
+          path: pack/
+          retention-days: 90
+          if-no-files-found: warn
+      # облачная пачка и зашифрованная копия описи: файлы без архива — Mac берёт куски по смещению
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && hashFiles('cloudpack/pack') != '' }}
+        with:
+          path: cloudpack/pack
+          archive: false
+          retention-days: 90
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && hashFiles('cloudpack/store.*.enc') != '' }}
+        with:
+          path: cloudpack/store.*.enc
+          archive: false
+          retention-days: 90
+          if-no-files-found: ignore
+
+  status:
+    needs: [prepare, build, shard, merge]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        env:
+          OK: ${{ needs.prepare.result == 'success' && needs.merge.result == 'success' }}
+        run: if [ "$OK" = true ]; then echo готово; else echo ошибка; fi > "$GITHUB_STEP_SUMMARY"
