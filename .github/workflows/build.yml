@@ -1,0 +1,91 @@
+name: build
+# Сборка runner под Linux x86-64 и aarch64, проверка тождества с эталоном (ci/canary.expected, снят на другой машине),
+# артефакты и постоянный выпуск сборки этого коммита build-<sha> (файлы забираются curl без авторизации). Выпуск — на
+# каждый коммит свой и прежние не трогаются: запуски match, начатые на прежнем коммите, берут свой бинарь и после
+# следующего push (новая выгрузка отправляется, не дожидаясь конца идущих кругов).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      arches:
+        description: 'JSON-список архитектур'
+        type: string
+        default: '["x86_64","aarch64"]'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.arches || '["x86_64","aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      # x86-64: уровень x86-64-v3 (AVX2) — есть на всех современных облачных машинах; aarch64: базовый набор.
+      RUSTFLAGS: ${{ matrix.arch == 'x86_64' && '-C target-cpu=x86-64-v3' || '' }}
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'crates/**') }}
+          restore-keys: cargo-${{ matrix.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+      - name: Build
+        run: cargo build --release --locked -p runner
+      - name: Package
+        run: ci/package.sh ${{ matrix.arch }}
+      - name: Identity check (canary)
+        run: |
+          ci/canary.sh dist/runner-linux-${{ matrix.arch }} > dist/canary-${{ matrix.arch }}.txt
+          diff -u ci/canary.expected dist/canary-${{ matrix.arch }}.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: runner-linux-${{ matrix.arch }}
+          path: dist/
+          retention-days: 1   # бинарь нужен только внутри запуска (match); постоянная копия — выпуск build-<sha>
+
+  release:
+    # только собственный запуск build на main (при вызове из match github.workflow == 'match')
+    if: github.workflow == 'build' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-build-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: runner-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Publish build of this commit
+        run: |
+          cd dist
+          echo "$GITHUB_SHA" > BUILD_COMMIT
+          ls -l
+          TAG="build-$GITHUB_SHA"
+          NOTES="Сборка коммита $GITHUB_SHA. Файлы: runner-linux-x86_64, runner-linux-aarch64 (+ .sha256, build-info-*.json). Тождество с эталоном проверено на обеих архитектурах."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" runner-linux-* build-info-*.json canary-*.txt BUILD_COMMIT --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" runner-linux-* build-info-*.json canary-*.txt BUILD_COMMIT \
+              --target "$GITHUB_SHA" --title "$TAG" --notes "$NOTES" --prerelease
+          fi
